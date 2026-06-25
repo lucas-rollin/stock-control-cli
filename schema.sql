@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS product (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
+    unit TEXT NOT NULL,
     active BOOLEAN NOT NULL DEFAULT 1
 );
 

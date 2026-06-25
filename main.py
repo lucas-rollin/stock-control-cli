@@ -15,6 +15,7 @@ DATABASE_PATH = "stock.db"
 HEADER_MAP = {
     "id": ("ID", "int"),
     "name": ("Nome", "str"),
+    "unit": ("Unidade", "str"),
     "active": ("Ativo", "bool"),
     "product_id": ("ID do Produto", "int"),
     "employee_id": ("ID do Funcionário", "int"),
@@ -22,7 +23,7 @@ HEADER_MAP = {
     "created_at": ("Criado em", "datetime")
 }
 
-# Data type formatter
+# Data type formatter for string display
 TYPE_FORMATTERS = {
     "int": lambda x: str(x),
     "str": lambda x: str(x) if x else "",
@@ -73,46 +74,45 @@ def display_values(
     Args:
         query: The SQL select query.
         title: Text place at the top of the panel.
-        inner_text: Text placed inside the panel above the table.
+        inner_text: Optional text placed inside the panel above the table.
 
     Returns:
-        The list of ids from the lookup.
+        A list of IDs (as strings) fetched from the primary column of the rows.
     """
-    if not query.strip().startswith("SELECT"):
-        raise("Attempted non select query")
+    if not query.strip().upper().startswith("SELECT"):
+        raise ValueError("Only SELECT queries are allowed in display_values.")
 
     headers, rows = run_sql(query, fetch=True)
 
-    headers_display = [HEADER_MAP.get(h, h)[0] for h in headers]
-
-    lookup_ids = [str(p[0]) for p in rows]
-
     # Build a table
     table = Table(show_header=True, header_style="bold magenta")
-    for h in headers_display:
-        table.add_column(h, style="cyan")
+    for h in headers:
+        display_name, _ = HEADER_MAP.get(h, (h, "str"))
+        table.add_column(display_name, style="cyan")
 
     # Convert row values to formatted strings before appending
     for row in rows:
         row_display = []
-        for i, e in enumerate(row):
-            _, data_type = HEADER_MAP[headers[i]]
-            type_formater = TYPE_FORMATTERS[data_type]
-            value = type_formater(e)
-            row_display.append(value)
+        for col_name, cell_value in zip(headers, row):
+            # Fallback to string if header metadata or formatter is missing
+            _, data_type = HEADER_MAP.get(col_name, (col_name, "str"))
+            formater = TYPE_FORMATTERS.get(data_type, lambda x: str(x))
+
+            row_display.append(formater(cell_value))
+
         table.add_row(*row_display)
 
     if inner_text:    
-        panel_content = Group(
-            inner_text,
-            table
-        )
+        panel_content = Group(inner_text, table)
     else:
         panel_content = table
 
     print(Panel.fit(panel_content, title=title))
 
-    return lookup_ids
+    # Return lookup IDs (assumes first column selected is the identifier)
+    lookup_ids = [str(p[0]) for p in rows]
+
+    return lookup_ids 
 
 # -----------------------------------------------
 # Visualization and Database Interaction
@@ -125,9 +125,10 @@ def display_logging_values(
     query = """
         SELECT 
             logging.id, 
-            product.name AS "Nome Produto", 
             employee.name AS "Nome Funcionário", 
+            product.name AS "Nome Produto",
             quantity, 
+            unit,
             created_at
         FROM logging JOIN product ON product_id = product.id, 
         employee ON employee_id = employee.id
@@ -140,7 +141,7 @@ def display_stock_values(
         inner_text: str|None = None
     ) :
     query = """
-        SELECT stock.id, quantity, name
+        SELECT stock.id, name, quantity, unit
         FROM stock JOIN product ON product_id = product.id
         WHERE product.active = true
     """
@@ -169,9 +170,9 @@ def display_stock_change_view(entry=True):
         employee_query = "SELECT id, name, active FROM employee WHERE name = ?"
         result = run_sql(employee_query, (employee_name,), True)[1]
         if not result:
-            print("\n[red]Funcionário não encontrado[/red]\n")
+            print("[red]Funcionário não encontrado[/red]\n")
         elif result[0][2] != 1:
-            print("\n[red]Funcionário não está ativo[/red]\n")
+            print("[red]Funcionário não está ativo[/red]\n")
         else:
             employee_id = result[0][0]
             print()
@@ -185,20 +186,21 @@ def display_stock_change_view(entry=True):
             # Quantity must be positive as sign is defined by the route
             if quantity_change <= 0:
                 print("[red]Digite um número positivo[/red]\n")
-            else:
-                quantity_query = "SELECT quantity FROM stock WHERE id = ?"
-                available_quantity = run_sql(quantity_query, (product_id,), True)[1][0][0]
-                
-                # New quantity after the transaction must be positive
-                if not entry:
-                    new_quantity = available_quantity - quantity_change
-                    if new_quantity < 0:
-                        print("[red]Digite uma quantidade menor que o existente para saída[/red]\n")
-                    else:
-                        break
-                else:
-                    new_quantity = available_quantity + quantity_change
-                    break
+                continue
+            
+            quantity_query = "SELECT quantity FROM stock WHERE id = ?"
+            available_quantity = run_sql(quantity_query, (product_id,), True)[1][0][0]
+
+            if not entry:
+                quantity_change = - quantity_change
+
+            # New quantity after the transaction must be positive    
+            new_quantity = available_quantity + quantity_change
+
+            if new_quantity < 0:
+                print("[red]Digite uma quantidade menor que o existente para saída[/red]\n")
+                continue
+            break
         except ValueError:
             print("[red]Digite um número[/red]\n")
 
@@ -270,23 +272,58 @@ def display_create_view(table_name: str, display_name: str):
         title=f"Cadastro de {display_name.capitalize()}"
     ))
 
-    while True:
-        name = Prompt.ask(f"Nome do {display_name}").strip()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        table_info = cursor.fetchall()
 
-        if name == "0":
-            return
-
-        if not name:
-            print(f"[red]O nome do {display_name} não pode ser vazio.[/red]\n")
-            continue
+        # Dinamically filter out primary keys and columns with defaults
+        headers = []
+        for col in table_info:
+            col_name = col[1]
+            has_default = col[4] is not None
+            is_pk = col[5] > 0
+            
+            if not is_pk and not has_default:
+                headers.append(col_name)
         
-        run_sql(
-            f"INSERT INTO {table_name} (name) VALUES (?)",
-            (name,)
+        values = []
+
+    for h in headers:
+        while True:
+            header_name, data_type = HEADER_MAP[h]
+            value = Prompt.ask(f"{header_name} do {display_name}")
+
+            if value == "0":
+                return
+            
+            if not value:
+                print(f"[red]O nome do {display_name} não pode ser vazio.[/red]\n")
+                continue
+
+            # Data type validation
+            try:
+                if data_type == "int":
+                    int(value)
+                elif data_type == "float":
+                    float(value).replace(',', '.')
+            except ValueError:
+                    print("[red]O valor deve ser um decimal válido.[/red]\n")
+            
+            values.append(value)
+            print()
+            break
+
+    joined_headers = ', '.join(headers)
+    joined_placeholders = ', '.join("?" for _ in values)
+
+    run_sql(
+            f"INSERT INTO {table_name} ({joined_headers})" 
+            f"VALUES ({joined_placeholders})",
+            values
         )
 
-        print(f"[green]✓ {display_name.capitalize()} '{name}' cadastrado com sucesso.[/green]\n")
-
+    print(f"[green]✓ {display_name.capitalize()} cadastrado com sucesso.[/green]\n")
 
 
 # -----------------------------------------------
